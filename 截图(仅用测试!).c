@@ -1,9 +1,17 @@
 #include <windows.h>
 #include <stdio.h>
+#include <strsafe.h> // For StringCchPrintfW
+#include <pathcch.h>  // For PathCchPrintfW
 
-void SaveBitmapToFile(HBITMAP hBitmap, const char* filename) {
+#pragma comment(lib, "Pathcch.lib")
+
+// Function to save a HBITMAP to a BMP file
+BOOL SaveBitmapToFile(HBITMAP hBitmap, const wchar_t* filename) {
     BITMAP bmp;
-    GetObject(hBitmap, sizeof(BITMAP), &bmp);
+    if (!GetObject(hBitmap, sizeof(BITMAP), &bmp)) {
+        wprintf(L"GetObject failed with error %lu\n", GetLastError());
+        return FALSE;
+    }
 
     BITMAPFILEHEADER bmfHeader;
     BITMAPINFOHEADER bi;
@@ -22,12 +30,40 @@ void SaveBitmapToFile(HBITMAP hBitmap, const char* filename) {
 
     DWORD dwBmpSize = ((bmp.bmWidth * bi.biBitCount + 31) / 32) * 4 * bmp.bmHeight;
 
+    // Allocate memory for the bitmap data
     HANDLE hDIB = GlobalAlloc(GHND, dwBmpSize);
+    if (!hDIB) {
+        wprintf(L"GlobalAlloc failed with error %lu\n", GetLastError());
+        return FALSE;
+    }
+
     char* pDIB = (char*)GlobalLock(hDIB);
+    if (!pDIB) {
+        wprintf(L"GlobalLock failed with error %lu\n", GetLastError());
+        GlobalFree(hDIB);
+        return FALSE;
+    }
 
-    GetDIBits(GetDC(0), hBitmap, 0, bmp.bmHeight, pDIB, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+    HDC hDC = GetDC(NULL);
+    if (!GetDIBits(hDC, hBitmap, 0, bmp.bmHeight, pDIB, (BITMAPINFO*)&bi, DIB_RGB_COLORS)) {
+        wprintf(L"GetDIBits failed with error %lu\n", GetLastError());
+        GlobalUnlock(hDIB);
+        GlobalFree(hDIB);
+        ReleaseDC(NULL, hDC);
+        return FALSE;
+    }
+    ReleaseDC(NULL, hDC);
 
-    HANDLE hFile = CreateFile(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // Create the file
+    HANDLE hFile = CreateFileW(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        wprintf(L"CreateFileW failed with error %lu\n", GetLastError());
+        GlobalUnlock(hDIB);
+        GlobalFree(hDIB);
+        return FALSE;
+    }
+
+    // Prepare the BITMAPFILEHEADER
     bmfHeader.bfType = 0x4D42; // "BM"
     bmfHeader.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + dwBmpSize;
     bmfHeader.bfReserved1 = 0;
@@ -35,42 +71,111 @@ void SaveBitmapToFile(HBITMAP hBitmap, const char* filename) {
     bmfHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
 
     DWORD dwWritten;
-    WriteFile(hFile, (LPSTR)&bmfHeader, sizeof(BITMAPFILEHEADER), &dwWritten, NULL);
-    WriteFile(hFile, (LPSTR)&bi, sizeof(BITMAPINFOHEADER), &dwWritten, NULL);
-    WriteFile(hFile, pDIB, dwBmpSize, &dwWritten, NULL);
+    if (!WriteFile(hFile, &bmfHeader, sizeof(BITMAPFILEHEADER), &dwWritten, NULL)) {
+        wprintf(L"WriteFile (BITMAPFILEHEADER) failed with error %lu\n", GetLastError());
+        CloseHandle(hFile);
+        GlobalUnlock(hDIB);
+        GlobalFree(hDIB);
+        return FALSE;
+    }
+
+    if (!WriteFile(hFile, &bi, sizeof(BITMAPINFOHEADER), &dwWritten, NULL)) {
+        wprintf(L"WriteFile (BITMAPINFOHEADER) failed with error %lu\n", GetLastError());
+        CloseHandle(hFile);
+        GlobalUnlock(hDIB);
+        GlobalFree(hDIB);
+        return FALSE;
+    }
+
+    if (!WriteFile(hFile, pDIB, dwBmpSize, &dwWritten, NULL)) {
+        wprintf(L"WriteFile (DIB data) failed with error %lu\n", GetLastError());
+        CloseHandle(hFile);
+        GlobalUnlock(hDIB);
+        GlobalFree(hDIB);
+        return FALSE;
+    }
 
     GlobalUnlock(hDIB);
     GlobalFree(hDIB);
     CloseHandle(hFile);
+    return TRUE;
 }
 
-void CaptureScreen(const char* folderPath) {
+// Function to capture the screen and save it to a file
+BOOL CaptureScreen(const wchar_t* folderPath) {
     HDC hScreenDC = GetDC(NULL);
     HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
 
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
     HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+    if (!hBitmap) {
+        wprintf(L"CreateCompatibleBitmap failed with error %lu\n", GetLastError());
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return FALSE;
+    }
 
-    SelectObject(hMemoryDC, hBitmap);
-    BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY);
+    if (!SelectObject(hMemoryDC, hBitmap)) {
+        wprintf(L"SelectObject failed with error %lu\n", GetLastError());
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return FALSE;
+    }
 
-    // Create folder if it doesn't exist
-    CreateDirectory(folderPath, NULL);
+    if (!BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY)) {
+        wprintf(L"BitBlt failed with error %lu\n", GetLastError());
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return FALSE;
+    }
+
+    // Ensure the folder exists
+    if (!CreateDirectoryW(folderPath, NULL)) {
+        DWORD dwError = GetLastError();
+        if (dwError != ERROR_ALREADY_EXISTS) {
+            wprintf(L"CreateDirectoryW failed with error %lu\n", dwError);
+            DeleteObject(hBitmap);
+            DeleteDC(hMemoryDC);
+            ReleaseDC(NULL, hScreenDC);
+            return FALSE;
+        }
+    }
+
+    // Prepare the filename
+    wchar_t filename[MAX_PATH];
+    if (FAILED(PathCchPrintfW(filename, MAX_PATH, L"%s\\screenshot.bmp", folderPath))) {
+        wprintf(L"PathCchPrintfW failed\n");
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return FALSE;
+    }
 
     // Save the bitmap to file
-    char filename[MAX_PATH];
-    sprintf(filename, "%s\\screenshot.bmp", folderPath);
-    SaveBitmapToFile(hBitmap, filename);
+    if (!SaveBitmapToFile(hBitmap, filename)) {
+        wprintf(L"SaveBitmapToFile failed\n");
+        DeleteObject(hBitmap);
+        DeleteDC(hMemoryDC);
+        ReleaseDC(NULL, hScreenDC);
+        return FALSE;
+    }
 
+    // Clean up
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);
     ReleaseDC(NULL, hScreenDC);
+    return TRUE;
 }
 
-int main() {
-    const char* folderPath = "skj";
-    CaptureScreen(folderPath);
-    printf("Screenshot saved to %s\\screenshot.bmp\n", folderPath);
+int wmain() {
+    const wchar_t* folderPath = L"skj";
+    if (CaptureScreen(folderPath)) {
+        wprintf(L"Screenshot saved to %s\\screenshot.bmp\n", folderPath);
+    } else {
+        wprintf(L"Failed to save screenshot\n");
+    }
     return 0;
 }
